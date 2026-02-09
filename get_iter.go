@@ -35,6 +35,13 @@ type getIter struct {
 	iterKey      *InternalKey
 	iterValue    base.LazyValue
 	err          error
+
+	// CASTLE
+	// sourceLevel tracks where the found key came from.
+	// -1 = memtable or batch, 0 = L0, 1-6 = L1-L6
+	sourceLevel int
+	// sourceInSSTable is true when the current iterator source is a levelIter (SSTable).
+	sourceInSSTable bool
 }
 
 // TODO(sumeer): CockroachDB code doesn't use getIter, but, for completeness,
@@ -133,6 +140,10 @@ func (g *getIter) Next() (*InternalKey, base.LazyValue) {
 			)
 			g.iterKey, g.iterValue = g.iter.SeekGE(g.key, base.SeekGEFlagsNone)
 			g.batch = nil
+
+			// CASTLE
+			g.sourceLevel = -1
+			g.sourceInSSTable = false
 			continue
 		}
 
@@ -149,6 +160,10 @@ func (g *getIter) Next() (*InternalKey, base.LazyValue) {
 			g.rangeDelIter = m.newRangeDelIter(nil)
 			g.mem = g.mem[:n-1]
 			g.iterKey, g.iterValue = g.iter.SeekGE(g.key, base.SeekGEFlagsNone)
+
+			// CASTLE
+			g.sourceLevel = -1
+			g.sourceInSSTable = false
 			continue
 		}
 
@@ -164,6 +179,10 @@ func (g *getIter) Next() (*InternalKey, base.LazyValue) {
 				bc := levelIterBoundaryContext{}
 				g.levelIter.initBoundaryContext(&bc)
 				g.iter = &g.levelIter
+
+				// CASTLE
+				g.sourceLevel = 0
+				g.sourceInSSTable = true
 
 				// Compute the key prefix for bloom filtering if split function is
 				// specified, or use the user key as default.
@@ -195,6 +214,11 @@ func (g *getIter) Next() (*InternalKey, base.LazyValue) {
 		g.levelIter.initRangeDel(&g.rangeDelIter)
 		bc := levelIterBoundaryContext{}
 		g.levelIter.initBoundaryContext(&bc)
+
+		// CASTLE
+		g.sourceLevel = g.level
+		g.sourceInSSTable = true
+
 		g.level++
 		g.iter = &g.levelIter
 

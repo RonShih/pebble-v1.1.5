@@ -520,6 +520,87 @@ func (d *DB) Get(key []byte) ([]byte, io.Closer, error) {
 	return d.getInternal(key, nil /* batch */, nil /* snapshot */)
 }
 
+// CASTLE
+// GetWithMetadata retrieves the given key and returns metadata about where it was found.
+// Returns:
+//   - value: the value bytes
+//   - level: -1 for memtable/batch, 0 for L0, 1-6 for L1-L6
+//   - sstable: SSTable file number (0 if not in SSTable)
+//   - closer: must be called when done with value
+//   - err: error if any
+func (d *DB) GetWithMetadata(key []byte) (value []byte, level int, sstable uint64, closer io.Closer, err error) {
+	if err := d.closed.Load(); err != nil {
+		return nil, 0, 0, nil, err.(error)
+	}
+
+	// Grab and reference the current readState. This prevents the underlying
+	// files in the associated version from being deleted if there is a current
+	// compaction. The readState is unref'd by Iterator.Close().
+	readState := d.loadReadState()
+
+	// Determine the seqnum to read at after grabbing the read state (current and
+	// memtables) above.
+	var seqNum uint64
+	seqNum = d.mu.versions.visibleSeqNum.Load()
+
+	buf := getIterAllocPool.Get().(*getIterAlloc)
+
+	get := &buf.get
+	*get = getIter{
+		logger:   d.opts.Logger,
+		comparer: d.opts.Comparer,
+		newIters: d.newIters,
+		snapshot: seqNum,
+		key:      key,
+		batch:    nil,
+		mem:      readState.memtables,
+		l0:       readState.current.L0SublevelFiles,
+		version:  readState.current,
+	}
+
+	// Strip off memtables which cannot possibly contain the seqNum being read at.
+	for len(get.mem) > 0 {
+		n := len(get.mem)
+		if logSeqNum := get.mem[n-1].logSeqNum; logSeqNum < seqNum {
+			break
+		}
+		get.mem = get.mem[:n-1]
+	}
+
+	i := &buf.dbi
+	pointIter := get
+	*i = Iterator{
+		ctx:          context.Background(),
+		getIterAlloc: buf,
+		iter:         pointIter,
+		pointIter:    pointIter,
+		merge:        d.merge,
+		comparer:     *d.opts.Comparer,
+		readState:    readState,
+		keyBuf:       buf.keyBuf,
+	}
+
+	if !i.First() {
+		level = get.sourceLevel
+		closeErr := i.Close()
+		if closeErr != nil {
+			return nil, level, 0, nil, closeErr
+		}
+		return nil, level, 0, nil, ErrNotFound
+	}
+
+	// CASTLE
+	// Extract metadata
+	level = get.sourceLevel
+	if get.sourceInSSTable && get.levelIter.iterFile != nil {
+		sstable = uint64(get.levelIter.iterFile.FileNum)
+	} else {
+		sstable = 0
+	}
+
+	return i.Value(), level, sstable, i, nil
+}
+
 type getIterAlloc struct {
 	dbi    Iterator
 	keyBuf []byte
