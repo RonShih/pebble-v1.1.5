@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/sstable" // CASTLE
 )
 
 // getIter is an internal iterator used to perform gets. It iterates through
@@ -42,6 +43,10 @@ type getIter struct {
 	sourceLevel int
 	// sourceInSSTable is true when the current iterator source is a levelIter (SSTable).
 	sourceInSSTable bool
+	// CASTLE: data block metadata from the sstable iterator.
+	castleBlockOffset uint64
+	castleBlockLength uint64
+	castleCacheHit    bool
 }
 
 // TODO(sumeer): CockroachDB code doesn't use getIter, but, for completeness,
@@ -111,6 +116,12 @@ func (g *getIter) Next() (*InternalKey, base.LazyValue) {
 					if !key.Visible(g.snapshot, base.InternalKeySeqNumMax) {
 						g.iterKey, g.iterValue = g.iter.Next()
 						continue
+					}
+					// CASTLE: extract block metadata from sstable iterator
+					if g.sourceInSSTable {
+						if bp, ok := g.levelIter.iter.(sstable.CastleBlockMetaProvider); ok {
+							g.castleBlockOffset, g.castleBlockLength, g.castleCacheHit = bp.CastleDataBlockMeta()
+						}
 					}
 					return g.iterKey, g.iterValue
 				}

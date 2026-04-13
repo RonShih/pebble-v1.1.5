@@ -521,16 +521,21 @@ func (d *DB) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 // CASTLE
+// GetMetadata contains metadata about where a key was found during a Get operation.
+type GetMetadata struct {
+	Level       int    // -1 = memtable/batch, 0 = L0, 1-6 = L1-L6
+	SSTable     uint64 // SSTable file number (0 if not in SSTable)
+	InSSTable   bool   // true if the key was found in an SSTable
+	BlockOffset uint64 // data block offset within the SSTable
+	BlockLength uint64 // data block length in bytes
+	CacheHit    bool   // true if the data block was served from block cache
+}
+
+// CASTLE
 // GetWithMetadata retrieves the given key and returns metadata about where it was found.
-// Returns:
-//   - value: the value bytes
-//   - level: -1 for memtable/batch, 0 for L0, 1-6 for L1-L6
-//   - sstable: SSTable file number (0 if not in SSTable)
-//   - closer: must be called when done with value
-//   - err: error if any
-func (d *DB) GetWithMetadata(key []byte) (value []byte, level int, sstable uint64, closer io.Closer, err error) {
+func (d *DB) GetWithMetadata(key []byte) (value []byte, meta GetMetadata, closer io.Closer, err error) {
 	if err := d.closed.Load(); err != nil {
-		return nil, 0, 0, nil, err.(error)
+		return nil, GetMetadata{}, nil, err.(error)
 	}
 
 	// Grab and reference the current readState. This prevents the underlying
@@ -581,24 +586,25 @@ func (d *DB) GetWithMetadata(key []byte) (value []byte, level int, sstable uint6
 	}
 
 	if !i.First() {
-		level = get.sourceLevel
+		meta.Level = get.sourceLevel
 		closeErr := i.Close()
 		if closeErr != nil {
-			return nil, level, 0, nil, closeErr
+			return nil, meta, nil, closeErr
 		}
-		return nil, level, 0, nil, ErrNotFound
+		return nil, meta, nil, ErrNotFound
 	}
 
-	// CASTLE
-	// Extract metadata
-	level = get.sourceLevel
+	// CASTLE: extract all metadata
+	meta.Level = get.sourceLevel
+	meta.InSSTable = get.sourceInSSTable
 	if get.sourceInSSTable && get.levelIter.iterFile != nil {
-		sstable = uint64(get.levelIter.iterFile.FileNum)
-	} else {
-		sstable = 0
+		meta.SSTable = uint64(get.levelIter.iterFile.FileNum)
+		meta.BlockOffset = get.castleBlockOffset
+		meta.BlockLength = get.castleBlockLength
+		meta.CacheHit = get.castleCacheHit
 	}
 
-	return i.Value(), level, sstable, i, nil
+	return i.Value(), meta, i, nil
 }
 
 type getIterAlloc struct {

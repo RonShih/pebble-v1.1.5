@@ -143,8 +143,8 @@ func (l *Layout) Describe(
 			continue
 		}
 
-		h, err := r.readBlock(
-			context.Background(), b.BlockHandle, nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */)
+		h, _, err := r.readBlock(
+			context.Background(), b.BlockHandle, nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */) // CASTLE: ignore cacheHit
 		if err != nil {
 			fmt.Fprintf(w, "  [err: %s]\n", err)
 			continue

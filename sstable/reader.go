@@ -444,24 +444,28 @@ func (r *Reader) readIndex(
 	ctx context.Context, stats *base.InternalIteratorStats,
 ) (bufferHandle, error) {
 	ctx = objiotracing.WithBlockType(ctx, objiotracing.MetadataBlock)
-	return r.readBlock(ctx, r.indexBH, nil, nil, stats, nil /* buffer pool */)
+	h, _, err := r.readBlock(ctx, r.indexBH, nil, nil, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
+	return h, err
 }
 
 func (r *Reader) readFilter(
 	ctx context.Context, stats *base.InternalIteratorStats,
 ) (bufferHandle, error) {
 	ctx = objiotracing.WithBlockType(ctx, objiotracing.FilterBlock)
-	return r.readBlock(ctx, r.filterBH, nil /* transform */, nil /* readHandle */, stats, nil /* buffer pool */)
+	h, _, err := r.readBlock(ctx, r.filterBH, nil /* transform */, nil /* readHandle */, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
+	return h, err
 }
 
 func (r *Reader) readRangeDel(stats *base.InternalIteratorStats) (bufferHandle, error) {
 	ctx := objiotracing.WithBlockType(context.Background(), objiotracing.MetadataBlock)
-	return r.readBlock(ctx, r.rangeDelBH, r.rangeDelTransform, nil /* readHandle */, stats, nil /* buffer pool */)
+	h, _, err := r.readBlock(ctx, r.rangeDelBH, r.rangeDelTransform, nil /* readHandle */, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
+	return h, err
 }
 
 func (r *Reader) readRangeKey(stats *base.InternalIteratorStats) (bufferHandle, error) {
 	ctx := objiotracing.WithBlockType(context.Background(), objiotracing.MetadataBlock)
-	return r.readBlock(ctx, r.rangeKeyBH, nil /* transform */, nil /* readHandle */, stats, nil /* buffer pool */)
+	h, _, err := r.readBlock(ctx, r.rangeKeyBH, nil /* transform */, nil /* readHandle */, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
+	return h, err
 }
 
 func checkChecksum(
@@ -516,6 +520,7 @@ func (b cacheValueOrBuf) truncate(n int) {
 	}
 }
 
+// CASTLE: readBlock returns cacheHit indicating whether the block was served from cache.
 func (r *Reader) readBlock(
 	ctx context.Context,
 	bh BlockHandle,
@@ -523,7 +528,7 @@ func (r *Reader) readBlock(
 	readHandle objstorage.ReadHandle,
 	stats *base.InternalIteratorStats,
 	bufferPool *BufferPool,
-) (handle bufferHandle, _ error) {
+) (handle bufferHandle, cacheHit bool, _ error) {
 	if h := r.opts.Cache.Get(r.cacheID, r.fileNum, bh.Offset); h.Get() != nil {
 		// Cache hit.
 		if readHandle != nil {
@@ -535,7 +540,7 @@ func (r *Reader) readBlock(
 		}
 		// This block is already in the cache; return a handle to existing vlaue
 		// in the cache.
-		return bufferHandle{h: h}, nil
+		return bufferHandle{h: h}, true, nil // CASTLE: cache hit
 	}
 
 	// Cache miss.
@@ -543,7 +548,7 @@ func (r *Reader) readBlock(
 	if sema := r.opts.LoadBlockSema; sema != nil {
 		if err := sema.Acquire(ctx, 1); err != nil {
 			// An error here can only come from the context.
-			return bufferHandle{}, err
+			return bufferHandle{}, false, err
 		}
 		defer sema.Release(1)
 	}
@@ -585,11 +590,11 @@ func (r *Reader) readBlock(
 	}
 	if err != nil {
 		compressed.release()
-		return bufferHandle{}, err
+		return bufferHandle{}, false, err
 	}
 	if err := checkChecksum(r.checksumType, compressed.get(), bh, r.fileNum.FileNum()); err != nil {
 		compressed.release()
-		return bufferHandle{}, err
+		return bufferHandle{}, false, err
 	}
 
 	typ := blockType(compressed.get()[bh.Length])
@@ -603,7 +608,7 @@ func (r *Reader) readBlock(
 		decodedLen, prefixLen, err := decompressedLen(typ, compressed.get())
 		if err != nil {
 			compressed.release()
-			return bufferHandle{}, err
+			return bufferHandle{}, false, err
 		}
 
 		if bufferPool != nil {
@@ -613,7 +618,7 @@ func (r *Reader) readBlock(
 		}
 		if _, err := decompressInto(typ, compressed.get()[prefixLen:], decompressed.get()); err != nil {
 			compressed.release()
-			return bufferHandle{}, err
+			return bufferHandle{}, false, err
 		}
 		compressed.release()
 	}
@@ -624,7 +629,7 @@ func (r *Reader) readBlock(
 		tmpTransformed, err := transform(decompressed.get())
 		if err != nil {
 			decompressed.release()
-			return bufferHandle{}, err
+			return bufferHandle{}, false, err
 		}
 
 		var transformed cacheValueOrBuf
@@ -639,10 +644,10 @@ func (r *Reader) readBlock(
 	}
 
 	if decompressed.buf.Valid() {
-		return bufferHandle{b: decompressed.buf}, nil
+		return bufferHandle{b: decompressed.buf}, false, nil // CASTLE: cache miss
 	}
 	h := r.opts.Cache.Set(r.cacheID, r.fileNum, bh.Offset, decompressed.v)
-	return bufferHandle{h: h}, nil
+	return bufferHandle{h: h}, false, nil // CASTLE: cache miss
 }
 
 func (r *Reader) transformRangeDelV1(b []byte) ([]byte, error) {
@@ -702,8 +707,8 @@ func (r *Reader) readMetaindex(metaindexBH BlockHandle) error {
 	// allocator. We don't expect to use metaBufferPool again.
 	defer r.metaBufferPool.Release()
 
-	b, err := r.readBlock(
-		context.Background(), metaindexBH, nil /* transform */, nil /* readHandle */, nil /* stats */, &r.metaBufferPool)
+	b, _, err := r.readBlock(
+		context.Background(), metaindexBH, nil /* transform */, nil /* readHandle */, nil /* stats */, &r.metaBufferPool) // CASTLE: ignore cacheHit
 	if err != nil {
 		return err
 	}
@@ -745,8 +750,8 @@ func (r *Reader) readMetaindex(metaindexBH BlockHandle) error {
 	}
 
 	if bh, ok := meta[metaPropertiesName]; ok {
-		b, err = r.readBlock(
-			context.Background(), bh, nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */)
+		b, _, err = r.readBlock(
+			context.Background(), bh, nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */) // CASTLE: ignore cacheHit
 		if err != nil {
 			return err
 		}
@@ -851,8 +856,8 @@ func (r *Reader) Layout() (*Layout, error) {
 			}
 			l.Index = append(l.Index, indexBH.BlockHandle)
 
-			subIndex, err := r.readBlock(context.Background(), indexBH.BlockHandle,
-				nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */)
+			subIndex, _, err := r.readBlock(context.Background(), indexBH.BlockHandle,
+				nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */) // CASTLE: ignore cacheHit
 			if err != nil {
 				return nil, err
 			}
@@ -875,7 +880,7 @@ func (r *Reader) Layout() (*Layout, error) {
 		}
 	}
 	if r.valueBIH.h.Length != 0 {
-		vbiH, err := r.readBlock(context.Background(), r.valueBIH.h, nil, nil, nil, nil /* buffer pool */)
+		vbiH, _, err := r.readBlock(context.Background(), r.valueBIH.h, nil, nil, nil, nil /* buffer pool */) // CASTLE: ignore cacheHit
 		if err != nil {
 			return nil, err
 		}
@@ -946,7 +951,7 @@ func (r *Reader) ValidateBlockChecksums() error {
 		}
 
 		// Read the block, which validates the checksum.
-		h, err := r.readBlock(context.Background(), bh, nil, rh, nil, nil /* buffer pool */)
+		h, _, err := r.readBlock(context.Background(), bh, nil, rh, nil, nil /* buffer pool */) // CASTLE: ignore cacheHit
 		if err != nil {
 			return err
 		}
@@ -1013,8 +1018,8 @@ func (r *Reader) EstimateDiskUsage(start, end []byte) (uint64, error) {
 		if err != nil {
 			return 0, errCorruptIndexEntry
 		}
-		startIdxBlock, err := r.readBlock(context.Background(), startIdxBH.BlockHandle,
-			nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */)
+		startIdxBlock, _, err := r.readBlock(context.Background(), startIdxBH.BlockHandle,
+			nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */) // CASTLE: ignore cacheHit
 		if err != nil {
 			return 0, err
 		}
@@ -1034,8 +1039,8 @@ func (r *Reader) EstimateDiskUsage(start, end []byte) (uint64, error) {
 			if err != nil {
 				return 0, errCorruptIndexEntry
 			}
-			endIdxBlock, err := r.readBlock(context.Background(),
-				endIdxBH.BlockHandle, nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */)
+			endIdxBlock, _, err := r.readBlock(context.Background(),
+				endIdxBH.BlockHandle, nil /* transform */, nil /* readHandle */, nil /* stats */, nil /* buffer pool */) // CASTLE: ignore cacheHit
 			if err != nil {
 				return 0, err
 			}

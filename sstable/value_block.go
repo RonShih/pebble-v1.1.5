@@ -753,7 +753,8 @@ func (bpwc blockProviderWhenClosed) readBlockForVBR(
 	// TODO(jackson,sumeer): Consider whether to use a buffer pool in this case.
 	// The bpwc is not allowed to outlive the iterator tree, so it cannot
 	// outlive the buffer pool.
-	return bpwc.r.readBlock(ctx, h, nil, nil, stats, nil /* buffer pool */)
+	bh, _, err := bpwc.r.readBlock(ctx, h, nil, nil, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
+	return bh, err
 }
 
 // ReaderProvider supports the implementation of blockProviderWhenClosed.

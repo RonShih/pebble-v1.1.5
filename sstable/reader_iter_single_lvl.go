@@ -55,6 +55,11 @@ type singleLevelIterator struct {
 	stats        *base.InternalIteratorStats
 	bufferPool   *BufferPool
 
+	// CASTLE: data block metadata from the last loadBlock call.
+	castleBlockOffset uint64
+	castleBlockLength uint64
+	castleCacheHit    bool
+
 	// boundsCmp and positionedUsingLatestBounds are for optimizing iteration
 	// that uses multiple adjacent bounds. The seek after setting a new bound
 	// can use the fact that the iterator is either within the previous bounds
@@ -395,7 +400,11 @@ func (i *singleLevelIterator) loadBlock(dir int8) loadBlockResult {
 		// blockIntersects
 	}
 	ctx := objiotracing.WithBlockType(i.ctx, objiotracing.DataBlock)
-	block, err := i.reader.readBlock(ctx, i.dataBH, nil /* transform */, i.dataRH, i.stats, i.bufferPool)
+	// CASTLE: capture data block metadata and cache hit/miss
+	block, castleCH, err := i.reader.readBlock(ctx, i.dataBH, nil /* transform */, i.dataRH, i.stats, i.bufferPool)
+	i.castleBlockOffset = i.dataBH.Offset
+	i.castleBlockLength = i.dataBH.Length
+	i.castleCacheHit = castleCH
 	if err != nil {
 		i.err = err
 		return loadBlockFailed
@@ -410,13 +419,19 @@ func (i *singleLevelIterator) loadBlock(dir int8) loadBlockResult {
 	return loadBlockOK
 }
 
+// CASTLE: CastleDataBlockMeta returns the metadata of the last loaded data block.
+func (i *singleLevelIterator) CastleDataBlockMeta() (offset uint64, length uint64, cacheHit bool) {
+	return i.castleBlockOffset, i.castleBlockLength, i.castleCacheHit
+}
+
 // readBlockForVBR implements the blockProviderWhenOpen interface for use by
 // the valueBlockReader.
 func (i *singleLevelIterator) readBlockForVBR(
 	ctx context.Context, h BlockHandle, stats *base.InternalIteratorStats,
 ) (bufferHandle, error) {
 	ctx = objiotracing.WithBlockType(ctx, objiotracing.ValueBlock)
-	return i.reader.readBlock(ctx, h, nil, i.vbRH, stats, i.bufferPool)
+	bh, _, err := i.reader.readBlock(ctx, h, nil, i.vbRH, stats, i.bufferPool) // CASTLE: ignore cacheHit
+	return bh, err
 }
 
 // resolveMaybeExcluded is invoked when the block-property filterer has found
