@@ -7,6 +7,7 @@ package sstable
 import (
 	"context"
 	"fmt"
+	"time" // CASTLE
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
@@ -61,7 +62,11 @@ func (i *twoLevelIterator) loadIndex(dir int8) loadBlockResult {
 		// blockIntersects
 	}
 	ctx := objiotracing.WithBlockType(i.ctx, objiotracing.MetadataBlock)
-	indexBlock, _, err := i.reader.readBlock(ctx, bhp.BlockHandle, nil /* transform */, nil /* readHandle */, i.stats, i.bufferPool) // CASTLE: ignore cacheHit
+	// CASTLE: capture the lower-level index block's cacheHit. For two-level
+	// iterators this is the per-seek index work, which is what SSTableProbe's
+	// indexCacheHit field reports.
+	indexBlock, indexCacheHit, err := i.reader.readBlock(ctx, bhp.BlockHandle, nil /* transform */, nil /* readHandle */, i.stats, i.bufferPool)
+	i.castleIndexCacheHit = CastleBool(indexCacheHit)
 	if err != nil {
 		i.err = err
 		return loadBlockFailed
@@ -152,7 +157,7 @@ func (i *twoLevelIterator) init(
 	if r.err != nil {
 		return r.err
 	}
-	topLevelIndexH, err := r.readIndex(ctx, stats)
+	topLevelIndexH, _, err := r.readIndex(ctx, stats)
 	if err != nil {
 		return err
 	}
@@ -383,7 +388,7 @@ func (i *twoLevelIterator) SeekGE(
 // to the caller to ensure that key is greater than or equal to the lower bound.
 func (i *twoLevelIterator) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, base.LazyValue) {
+) (k *base.InternalKey, value base.LazyValue) {
 	if i.vState != nil {
 		// Callers of SeekGE don't know about virtual sstable bounds, so we may
 		// have to internally restrict the bounds.
@@ -394,6 +399,18 @@ func (i *twoLevelIterator) SeekPrefixGE(
 			key = i.lower
 		}
 	}
+
+	// CASTLE: SSTableProbe instrumentation owned by the two-level wrapper.
+	// Reset per-seek state, capture along the way, emit at every return path
+	// via defer. Note: we also clear castleIndexCacheHit so loadIndex's write
+	// is the authoritative value for this seek (the field is otherwise sticky
+	// across seeks within an iterator's lifetime).
+	probeStart := time.Now()
+	i.castleProbeReset()
+	i.castleIndexCacheHit = CastleUnset
+	defer func() {
+		i.castleEmitProbeFromState(key, k != nil, time.Since(probeStart).Nanoseconds())
+	}()
 
 	// NOTE: prefix is only used for bloom filter checking and not later work in
 	// this method. Hence, we can use the existing iterator position if the last
@@ -416,19 +433,23 @@ func (i *twoLevelIterator) SeekPrefixGE(
 
 	// Check prefix bloom filter.
 	if i.reader.tableFilter != nil && i.useFilter {
+		i.castleProbeFilterChecked = true // CASTLE
 		if !i.lastBloomFilterMatched {
 			// Iterator is not positioned based on last seek.
 			flags = flags.DisableTrySeekUsingNext()
 		}
 		i.lastBloomFilterMatched = false
 		var dataH bufferHandle
-		dataH, i.err = i.reader.readFilter(i.ctx, i.stats)
+		var filterCacheHit bool
+		dataH, filterCacheHit, i.err = i.reader.readFilter(i.ctx, i.stats)
+		i.castleProbeFilterCacheHit = CastleBool(filterCacheHit) // CASTLE
 		if i.err != nil {
 			i.data.invalidate()
 			return nil, base.LazyValue{}
 		}
 		mayContain := i.reader.tableFilter.mayContain(dataH.Get(), prefix)
 		dataH.Release()
+		i.castleProbeFilterPositive = CastleBool(mayContain) // CASTLE
 		if !mayContain {
 			// This invalidation may not be necessary for correctness, and may
 			// be a place to optimize later by reusing the already loaded

@@ -440,20 +440,22 @@ func (i *rangeKeyFragmentBlockIter) Close() error {
 	return err
 }
 
+// CASTLE: readIndex returns cacheHit indicating whether the index block was
+// served from the block cache.
 func (r *Reader) readIndex(
 	ctx context.Context, stats *base.InternalIteratorStats,
-) (bufferHandle, error) {
+) (bufferHandle, bool, error) {
 	ctx = objiotracing.WithBlockType(ctx, objiotracing.MetadataBlock)
-	h, _, err := r.readBlock(ctx, r.indexBH, nil, nil, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
-	return h, err
+	return r.readBlock(ctx, r.indexBH, nil, nil, stats, nil /* buffer pool */)
 }
 
+// CASTLE: readFilter returns cacheHit indicating whether the filter block was
+// served from the block cache.
 func (r *Reader) readFilter(
 	ctx context.Context, stats *base.InternalIteratorStats,
-) (bufferHandle, error) {
+) (bufferHandle, bool, error) {
 	ctx = objiotracing.WithBlockType(ctx, objiotracing.FilterBlock)
-	h, _, err := r.readBlock(ctx, r.filterBH, nil /* transform */, nil /* readHandle */, stats, nil /* buffer pool */) // CASTLE: ignore cacheHit
-	return h, err
+	return r.readBlock(ctx, r.filterBH, nil /* transform */, nil /* readHandle */, stats, nil /* buffer pool */)
 }
 
 func (r *Reader) readRangeDel(stats *base.InternalIteratorStats) (bufferHandle, error) {
@@ -824,7 +826,7 @@ func (r *Reader) Layout() (*Layout, error) {
 		Format:     r.tableFormat,
 	}
 
-	indexH, err := r.readIndex(context.Background(), nil)
+	indexH, _, err := r.readIndex(context.Background(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -986,7 +988,7 @@ func (r *Reader) EstimateDiskUsage(start, end []byte) (uint64, error) {
 		return 0, r.err
 	}
 
-	indexH, err := r.readIndex(context.Background(), nil)
+	indexH, _, err := r.readIndex(context.Background(), nil)
 	if err != nil {
 		return 0, err
 	}

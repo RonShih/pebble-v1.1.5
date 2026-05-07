@@ -928,7 +928,7 @@ func TestBlockProperties(t *testing.T) {
 
 				// Enumerate point key data blocks encoded into the index.
 				if f != nil {
-					indexH, err := r.readIndex(context.Background(), nil)
+					indexH, _, err := r.readIndex(context.Background(), nil)
 					if err != nil {
 						return err.Error()
 					}
@@ -1269,7 +1269,7 @@ func runBlockPropertiesBuildCmd(td *datadriven.TestData) (r *Reader, out string)
 }
 
 func runBlockPropsCmd(r *Reader, td *datadriven.TestData) string {
-	bh, err := r.readIndex(context.Background(), nil)
+	bh, _, err := r.readIndex(context.Background(), nil)
 	if err != nil {
 		return err.Error()
 	}

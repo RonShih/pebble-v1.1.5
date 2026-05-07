@@ -544,6 +544,14 @@ func (c *tableCacheShard) newIters(
 	// care to avoid introducing an allocation here by adding a closure.
 	iter.SetCloseHook(v.closeHook)
 
+	// CASTLE: pass the LSM level into the sstable iterator so the SSTableProbe
+	// event it emits can include the level. opts may be nil for compaction.
+	if opts != nil {
+		if cs, ok := iter.(sstable.CastleProbeContextSetter); ok {
+			cs.SetCastleProbeContext(manifest.LevelToInt(opts.level))
+		}
+	}
+
 	c.iterCount.Add(1)
 	dbOpts.iterCount.Add(1)
 	if invariants.RaceEnabled {

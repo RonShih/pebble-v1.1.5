@@ -143,6 +143,11 @@ type ReaderOptions struct {
 
 	// Logger is an optional logger and tracer.
 	LoggerAndTracer base.LoggerAndTracer
+
+	// CASTLE: CastleProbeRecorder, if non-nil, receives one event per SSTable
+	// visited during a Get. See CastleProbeEvent for field semantics. nil
+	// disables emission with zero overhead.
+	CastleProbeRecorder CastleProbeRecorder
 }
 
 func (o ReaderOptions) ensureDefaults() ReaderOptions {

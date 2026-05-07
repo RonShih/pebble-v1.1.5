@@ -834,6 +834,11 @@ type Options struct {
 	// LoggerAndTracer is used for writing log messages and traces.
 	LoggerAndTracer LoggerAndTracer
 
+	// CASTLE: CastleProbeRecorder, if non-nil, receives one event per SSTable
+	// visited during a Get. Used to compute true per-Get internal read
+	// amplification including bloom-rejected SSTables. See sstable.CastleProbeEvent.
+	CastleProbeRecorder sstable.CastleProbeRecorder
+
 	// MaxManifestFileSize is the maximum size the MANIFEST file is allowed to
 	// become. When the MANIFEST exceeds this size it is rolled over and a new
 	// MANIFEST is created.
@@ -1740,6 +1745,7 @@ func (o *Options) MakeReaderOptions() sstable.ReaderOptions {
 			readerOpts.MergerName = o.Merger.Name
 		}
 		readerOpts.LoggerAndTracer = o.LoggerAndTracer
+		readerOpts.CastleProbeRecorder = o.CastleProbeRecorder // CASTLE
 	}
 	return readerOpts
 }

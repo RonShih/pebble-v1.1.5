@@ -7,6 +7,7 @@ package sstable
 import (
 	"context"
 	"fmt"
+	"time" // CASTLE
 	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/base"
@@ -59,6 +60,17 @@ type singleLevelIterator struct {
 	castleBlockOffset uint64
 	castleBlockLength uint64
 	castleCacheHit    bool
+
+	// CASTLE: SSTableProbe state. castleLevel is set by the table cache before
+	// the first seek (-1 if unset, e.g. during compaction). The other fields
+	// are written by seekPrefixGE/loadIndex along the way and read by the outer
+	// SeekPrefixGE wrapper (single-level or two-level) to emit one probe event
+	// per seek. They are reset at the start of every outer SeekPrefixGE.
+	castleLevel               int
+	castleIndexCacheHit       CastleOptionalBool
+	castleProbeFilterChecked  bool
+	castleProbeFilterCacheHit CastleOptionalBool
+	castleProbeFilterPositive CastleOptionalBool
 
 	// boundsCmp and positionedUsingLatestBounds are for optimizing iteration
 	// that uses multiple adjacent bounds. The seek after setting a new bound
@@ -185,7 +197,12 @@ func (i *singleLevelIterator) init(
 	if r.err != nil {
 		return r.err
 	}
-	indexH, err := r.readIndex(ctx, stats)
+	// CASTLE: capture index block cache hit for SSTableProbe. Set on iter so
+	// SeekPrefixGE can include it in the event. Reset every init since the
+	// iterator is pooled.
+	indexH, indexCacheHit, err := r.readIndex(ctx, stats)
+	i.castleIndexCacheHit = CastleBool(indexCacheHit)
+	i.castleLevel = -1 // reset; table cache will overwrite via SetCastleProbeContext.
 	if err != nil {
 		return err
 	}
@@ -422,6 +439,74 @@ func (i *singleLevelIterator) loadBlock(dir int8) loadBlockResult {
 // CASTLE: CastleDataBlockMeta returns the metadata of the last loaded data block.
 func (i *singleLevelIterator) CastleDataBlockMeta() (offset uint64, length uint64, cacheHit bool) {
 	return i.castleBlockOffset, i.castleBlockLength, i.castleCacheHit
+}
+
+// CASTLE: SetCastleProbeContext is called by the Pebble table cache to inform
+// the iterator which LSM level its parent SSTable lives at. Implements the
+// CastleProbeContextSetter interface.
+func (i *singleLevelIterator) SetCastleProbeContext(level int) {
+	i.castleLevel = level
+}
+
+// CASTLE: castleProbeReset clears per-seek probe state at the start of an
+// outer SeekPrefixGE call. Must be called before seekPrefixGE / loadIndex
+// touch the fields. Fields populated at iter init (castleIndexCacheHit for
+// single-level) are preserved; two-level callers also clear them explicitly
+// because loadIndex re-writes them per seek.
+//
+// We deliberately clear castleCacheHit too: loadBlock writes it only when a
+// data block is actually loaded for this seek, so the previous seek's value
+// must not leak into this seek's probe event. We use a sticky-ish bool here
+// (default false = "miss"); the probe emit code only reports it when filter
+// said "may contain", so the false default is harmless when bloom rejected.
+func (i *singleLevelIterator) castleProbeReset() {
+	i.castleProbeFilterChecked = false
+	i.castleProbeFilterCacheHit = CastleUnset
+	i.castleProbeFilterPositive = CastleUnset
+	i.castleCacheHit = false
+}
+
+// CASTLE: castleEmitProbeFromState emits one SSTableProbe event using the
+// state currently on the iterator. Called by both singleLevelIterator and
+// twoLevelIterator at the end of their public SeekPrefixGE methods. found is
+// passed in (the outer wrapper knows whether the seek returned a key).
+//
+// The data block cacheHit is read from castleCacheHit (written by loadBlock).
+// It is reported as Unset when no data work happened — bloom rejected is the
+// clear case.
+func (i *singleLevelIterator) castleEmitProbeFromState(
+	key []byte,
+	found bool,
+	latencyNs int64,
+) {
+	rec := i.reader.opts.CastleProbeRecorder
+	if rec == nil {
+		return
+	}
+	dataCacheHit := CastleUnset
+	indexCacheHit := i.castleIndexCacheHit
+	if i.castleProbeFilterPositive == CastleFalse {
+		// Bloom rejected: index/data blocks were not loaded for this seek. For
+		// single-level the index is always loaded once at iter init so it is
+		// physically cached, but reporting Unset matches the "did this seek
+		// touch the block" semantics that the trace consumer wants.
+		indexCacheHit = CastleUnset
+	} else {
+		dataCacheHit = CastleBool(i.castleCacheHit)
+	}
+	rec(CastleProbeEvent{
+		Level:          i.castleLevel,
+		SSTable:        uint64(i.reader.fileNum.FileNum()),
+		Key:            key,
+		FilterPresent:  i.reader.tableFilter != nil,
+		FilterChecked:  i.castleProbeFilterChecked,
+		FilterCacheHit: i.castleProbeFilterCacheHit,
+		FilterPositive: i.castleProbeFilterPositive,
+		IndexCacheHit:  indexCacheHit,
+		DataCacheHit:   dataCacheHit,
+		Found:          found,
+		LatencyNs:      latencyNs,
+	})
 }
 
 // readBlockForVBR implements the blockProviderWhenOpen interface for use by
@@ -777,7 +862,15 @@ func (i *singleLevelIterator) SeekPrefixGE(
 			key = i.lower
 		}
 	}
-	return i.seekPrefixGE(prefix, key, flags, i.useFilter)
+	// CASTLE: emit one SSTableProbe event for this seek. Reset per-seek state
+	// first so we don't read stale fields from a prior pooled use. The inner
+	// seekPrefixGE writes filterChecked/CacheHit/Positive into the iterator;
+	// we read them after it returns.
+	probeStart := time.Now()
+	i.castleProbeReset()
+	k, v := i.seekPrefixGE(prefix, key, flags, i.useFilter)
+	i.castleEmitProbeFromState(key, k != nil, time.Since(probeStart).Nanoseconds())
+	return k, v
 }
 
 func (i *singleLevelIterator) seekPrefixGE(
@@ -790,6 +883,8 @@ func (i *singleLevelIterator) seekPrefixGE(
 	err := i.err
 	i.err = nil // clear cached iteration error
 	if checkFilter && i.reader.tableFilter != nil {
+		// CASTLE: record that we consulted the bloom filter for this seek.
+		i.castleProbeFilterChecked = true
 		if !i.lastBloomFilterMatched {
 			// Iterator is not positioned based on last seek.
 			flags = flags.DisableTrySeekUsingNext()
@@ -797,13 +892,16 @@ func (i *singleLevelIterator) seekPrefixGE(
 		i.lastBloomFilterMatched = false
 		// Check prefix bloom filter.
 		var dataH bufferHandle
-		dataH, i.err = i.reader.readFilter(i.ctx, i.stats)
+		var filterCacheHit bool
+		dataH, filterCacheHit, i.err = i.reader.readFilter(i.ctx, i.stats)
+		i.castleProbeFilterCacheHit = CastleBool(filterCacheHit) // CASTLE
 		if i.err != nil {
 			i.data.invalidate()
 			return nil, base.LazyValue{}
 		}
 		mayContain := i.reader.tableFilter.mayContain(dataH.Get(), prefix)
 		dataH.Release()
+		i.castleProbeFilterPositive = CastleBool(mayContain) // CASTLE
 		if !mayContain {
 			// This invalidation may not be necessary for correctness, and may
 			// be a place to optimize later by reusing the already loaded
