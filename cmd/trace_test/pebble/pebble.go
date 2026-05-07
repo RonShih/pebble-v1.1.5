@@ -3,15 +3,39 @@
 package pebble
 
 import (
+	"bytes"
 	"fmt"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/cmd/trace_test/common"
+	"github.com/cockroachdb/pebble/sstable"
 )
+
+// curGoroutineID returns the current goroutine's id by parsing the runtime
+// stack header. Used so that SSTableProbe events can be matched up with the
+// Get event that triggered them when multiple goroutines call Get concurrently.
+func curGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Stack header: "goroutine 12345 [running]:\n..."
+	prefix := []byte("goroutine ")
+	b := buf[:n]
+	if !bytes.HasPrefix(b, prefix) {
+		return 0
+	}
+	b = b[len(prefix):]
+	end := bytes.IndexByte(b, ' ')
+	if end < 0 {
+		return 0
+	}
+	id, _ := strconv.ParseUint(string(b[:end]), 10, 64)
+	return id
+}
 
 const (
 	minCache   = 16
@@ -78,12 +102,35 @@ func New(file string, cache int, handles int, namespace string, readonly bool, e
 	}
 	opt.Experimental.ReadSamplingMultiplier = -1
 
+	// CASTLE: emit one SSTableProbe trace line per candidate SSTable touched
+	// by a Get. The Get summary line is still emitted in Database.Get below;
+	// downstream parsers join probes to their Get by (gid, key).
+	opt.CastleProbeRecorder = func(e sstable.CastleProbeEvent) {
+		if !common.IsGlobalLogEnabled() {
+			return
+		}
+		s := fmt.Sprintf(
+			"OPType: SSTableProbe, key: %x, level: %d, sstable: %d, "+
+				"filterPresent: %v, filterChecked: %v, filterCacheHit: %s, filterPositive: %s, "+
+				"indexCacheHit: %s, dataCacheHit: %s, found: %v, latencyNs: %d, gid: %d",
+			e.Key, e.Level, e.SSTable,
+			e.FilterPresent, e.FilterChecked, e.FilterCacheHit, e.FilterPositive,
+			e.IndexCacheHit, e.DataCacheHit, e.Found, e.LatencyNs, curGoroutineID(),
+		)
+		common.WriteGlobalLog(s)
+	}
+
 	innerDB, err := pebble.Open(file, opt)
 	if err != nil {
 		return nil, err
 	}
 	db.db = innerDB
 	return db, nil
+}
+
+// Stat returns the internal database statistics.
+func (d *Database) Stat() string {
+	return d.db.Metrics().String()
 }
 
 // Close closes the database.

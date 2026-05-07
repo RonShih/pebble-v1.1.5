@@ -7,3 +7,5 @@ mutex.prof
 coverprofile.out
 # Testing artifacts
 meta.*.test
+# CASTLE trace logs (produced by cmd/trace_test/)
+geth-trace-*

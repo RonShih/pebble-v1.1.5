@@ -42,6 +42,12 @@ func WriteGlobalLog(msg string) {
 	}
 }
 
+// IsGlobalLogEnabled returns whether global log writes are currently active.
+// CASTLE: used by hot-path emitters to avoid formatting cost when disabled.
+func IsGlobalLogEnabled() bool {
+	return shouldGlobalLogInUse && logIsInitiated
+}
+
 func InitGlobalLog() bool {
 	currentLogTime := time.Now().Format("2006-01-02-15-04-05")
 	currentLogFileName := "./geth-trace-" + currentLogTime

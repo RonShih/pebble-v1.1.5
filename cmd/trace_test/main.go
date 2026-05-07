@@ -29,8 +29,8 @@ func main() {
 	}
 
 	// 寫入一些 key-value pairs
-	fmt.Println("=== Writing 200000 keys ===")
-	for i := 0; i < 200000; i++ {
+	fmt.Println("=== Writing 10000 keys ===")
+	for i := 0; i < 10000; i++ {
 		key := fmt.Sprintf("key-%04d", i)
 		val := fmt.Sprintf("value-%04d-padding-data", i)
 		if err := db.Put([]byte(key), []byte(val)); err != nil {
@@ -54,7 +54,7 @@ func main() {
 
 	// 再次 Get（此時資料在 L0 SSTable）
 	fmt.Println("\n=== Get from L0 SSTable (first 10 keys) ===")
-	for i := 199500; i < 200000; i++ {
+	for i := 9500; i < 10000; i++ {
 		key := fmt.Sprintf("key-%04d", i)
 		val, err := db.Get([]byte(key))
 		if err != nil {
@@ -62,6 +62,25 @@ func main() {
 		}
 		fmt.Printf("%s = %s \n", key, val)
 	}
+
+	// CASTLE: probe non-existent keys that still fall within the SST's key
+	// range so the bloom-reject case shows up in the trace. (Keys outside the
+	// range get skipped by the manifest filter — purely in memory, no probe.)
+	// Keys are inserted as "key-NNNN" (8 chars); appending "x" puts the lookup
+	// strictly between two existing keys, e.g. "key-0001x" sorts after
+	// "key-0001" and before "key-0002".
+	fmt.Println("\n=== Get non-existent keys within SST range (bloom should reject most) ===")
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key-%04dx", i)
+		_, err := db.Get([]byte(key))
+		if err != nil && err.Error() != "pebble: not found" {
+			log.Fatal(err)
+		}
+		fmt.Printf("Get(%s) → not found (expected)\n", key)
+	}
+
+	fmt.Println("\n=== Pebble Statistics ===")
+	fmt.Println(db.Stat())
 
 	if err := db.Close(); err != nil {
 		log.Fatal(err)
